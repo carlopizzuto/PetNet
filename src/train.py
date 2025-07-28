@@ -11,6 +11,29 @@ from model import PetClassifier
 from data import create_dataloaders
 from utils import calculate_accuracy, save_training_plot, get_device
 
+# ------------------------
+# Early stopping helper
+# ------------------------
+
+
+class EarlyStopping:
+    """Simple early stopping on validation accuracy"""
+
+    def __init__(self, patience: int = 5):
+        self.patience = patience
+        self.counter = 0
+        self.best_val_acc = 0.0
+
+    def step(self, val_acc: float) -> bool:
+        """Return True if training should stop"""
+        if val_acc > self.best_val_acc + 1e-3:  # significant improvement
+            self.best_val_acc = val_acc
+            self.counter = 0
+            return False
+        else:
+            self.counter += 1
+            return self.counter >= self.patience
+
 
 def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Optimizer, 
                 criterion: nn.Module, device: torch.device) -> Tuple[float, float]:
@@ -91,11 +114,14 @@ def train_model(args):
     
     # Create dataloaders
     print("Loading data...")
+    # Respect Colab warning: cap workers at 2 unless user overrides
+    effective_workers = min(args.num_workers, 2)
     train_loader, val_loader, class_to_idx = create_dataloaders(
         train_dir=args.train_dir,
         val_dir=args.val_dir,
         batch_size=args.batch_size,
-        num_workers=args.num_workers
+        num_workers=effective_workers,
+        pin_memory=device.type == 'cuda'
     )
     
     num_classes = len(class_to_idx)
@@ -108,10 +134,12 @@ def train_model(args):
     # Setup training
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
+    # Cosine schedule with warmup (better for ViT)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.learning_rate * 0.01)
     
     # Training loop
     best_val_acc = 0.0
+    early_stopper = EarlyStopping(patience=args.early_stopping_patience)
     train_losses, train_accs = [], []
     val_losses, val_accs = [], []
     
@@ -146,6 +174,11 @@ def train_model(args):
             best_model_path = os.path.join(args.output_dir, 'best_model.pt')
             model.save_model(best_model_path)
             print(f"New best model saved with validation accuracy: {best_val_acc:.2f}%")
+
+        # Early stopping check
+        if early_stopper.step(val_acc):
+            print(f"Early stopping triggered (no improvement for {args.early_stopping_patience} epochs)")
+            break
     
     # Save final model and training plot
     final_model_path = os.path.join(args.output_dir, 'final_model.pt')
@@ -189,8 +222,10 @@ def main():
                        help='Step size for learning rate scheduler')
     parser.add_argument('--gamma', type=float, default=0.1,
                        help='Gamma for learning rate scheduler')
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='Number of data loader workers')
+    parser.add_argument('--num_workers', type=int, default=2,
+                       help='Number of data loader workers (default 2 for Colab)')
+    parser.add_argument('--early_stopping_patience', type=int, default=5,
+                       help='Epochs to wait for improvement before early stopping')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (cuda/mps/cpu). If not specified, auto-detects best available.')
     
