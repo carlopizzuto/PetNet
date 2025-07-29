@@ -132,7 +132,7 @@ def train_model(args):
     model.to(device)
     
     # Setup training
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing if args.label_smoothing > 0 else 0.0)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     # Cosine schedule with warmup (better for ViT)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.learning_rate * 0.01)
@@ -148,7 +148,14 @@ def train_model(args):
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         print("-" * 40)
-        
+        # Optionally freeze backbone for first N epochs
+        if epoch == 0 and args.freeze_epochs > 0:
+            model.freeze_backbone()
+            print(f"Backbone frozen for first {args.freeze_epochs} epochs")
+        if epoch == args.freeze_epochs:
+            model.unfreeze_backbone()
+            print("Backbone unfrozen – full fine-tuning now")
+
         # Train
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
         
@@ -226,6 +233,10 @@ def main():
                        help='Number of data loader workers (default 2 for Colab)')
     parser.add_argument('--early_stopping_patience', type=int, default=5,
                        help='Epochs to wait for improvement before early stopping')
+    parser.add_argument('--label_smoothing', type=float, default=0.1,
+                       help='Label smoothing factor (0 disables)')
+    parser.add_argument('--freeze_epochs', type=int, default=2,
+                       help='Number of initial epochs to train classifier head only (freeze ViT backbone)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (cuda/mps/cpu). If not specified, auto-detects best available.')
     
