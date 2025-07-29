@@ -1,9 +1,13 @@
 import os
+# Standard imports
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
 from PIL import Image
 from typing import Dict, List, Tuple, Optional
+
+# Hugging Face ViT image processor (handles resize / normalization)
+from transformers import ViTImageProcessor
+
 import json
 
 
@@ -79,64 +83,60 @@ class PetDataset(Dataset):
             return json.load(f)
 
 
-def get_transforms(image_size: int = 224, is_training: bool = True):
-    """
-    Get image transformations for training or validation.
-    ViT expects 224x224 images by default.
-    """
-    if is_training:
-        return transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])  # ImageNet stats
-        ])
-    else:
-        return transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
-        ])
+def get_transforms(model_name: str = "google/vit-base-patch16-224", **kwargs):
+    """Return a simple callable that converts a PIL image to a tensor of
+    pixel values using the ViT image processor associated with *model_name*.
+    The callable signature matches torchvision transforms: ``tensor = f(image)``.
+    Extra kwargs are ignored (for backward-compatibility with old calls)."""
+
+    processor = ViTImageProcessor.from_pretrained(model_name)
+
+    def _transform(image):
+        pixel_values = processor(image, return_tensors="pt")["pixel_values"]
+        return pixel_values.squeeze(0)  # drop batch dim → (3, H, W)
+
+    return _transform
 
 
-def create_dataloaders(train_dir: str, val_dir: str, batch_size: int = 32, 
-                      num_workers: int = 4, image_size: int = 224,
-                      pin_memory: bool = True) -> Tuple[DataLoader, DataLoader, Dict]:
+def create_dataloaders(train_dir: str, val_dir: str, batch_size: int = 32,
+                      num_workers: int = 4, pin_memory: bool = True,
+                      model_name: str = "google/vit-base-patch16-224") -> Tuple[DataLoader, DataLoader, Dict]:
     """
     Create training and validation dataloaders.
     Returns train_loader, val_loader, and class_to_idx mapping.
     """
-    # Create datasets
-    train_dataset = PetDataset(
-        data_dir=train_dir,
-        transform=get_transforms(image_size, is_training=True)
-    )
-    
-    val_dataset = PetDataset(
-        data_dir=val_dir,
-        transform=get_transforms(image_size, is_training=False),
-        class_to_idx=train_dataset.class_to_idx  # Use same mapping as training
-    )
-    
+    # Always use Hugging Face processor for robust preprocessing
+    processor = ViTImageProcessor.from_pretrained(model_name)
+
+    # Datasets keep raw PIL images; processor handles resize & normalization
+    train_dataset = PetDataset(data_dir=train_dir, transform=None)
+    val_dataset = PetDataset(data_dir=val_dir, transform=None, class_to_idx=train_dataset.class_to_idx)
+
+    def _collate(batch):
+        images = [item[0] for item in batch]
+        labels = torch.tensor([item[1] for item in batch])
+        pixel_values = processor(images, return_tensors="pt")["pixel_values"]
+        return pixel_values, labels
+
+    collate_fn = _collate
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=pin_memory
+        pin_memory=pin_memory,
+        collate_fn=collate_fn
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=pin_memory
+        pin_memory=pin_memory,
+        collate_fn=collate_fn
     )
     
     return train_loader, val_loader, train_dataset.class_to_idx

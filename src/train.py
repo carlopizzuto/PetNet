@@ -6,6 +6,8 @@ import argparse
 import os
 from tqdm import tqdm
 from typing import Dict, Tuple
+# Hugging Face helpers for better scheduling
+from transformers import get_cosine_schedule_with_warmup
 
 from model import PetClassifier
 from data import create_dataloaders
@@ -35,8 +37,8 @@ class EarlyStopping:
             return self.counter >= self.patience
 
 
-def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Optimizer, 
-                criterion: nn.Module, device: torch.device) -> Tuple[float, float]:
+def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Optimizer,
+                criterion: nn.Module, device: torch.device, scheduler=None) -> Tuple[float, float]:
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
@@ -56,6 +58,10 @@ def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Opt
         # Backward pass
         loss.backward()
         optimizer.step()
+
+        # Scheduler is stepped every batch (needed for warm-up + cosine)
+        if scheduler is not None:
+            scheduler.step()
         
         # Statistics
         total_loss += loss.item()
@@ -132,10 +138,17 @@ def train_model(args):
     model.to(device)
     
     # Setup training
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing if args.label_smoothing > 0 else 0.0)
+    criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    # Cosine schedule with warmup (better for ViT)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.learning_rate * 0.01)
+
+    # Cosine schedule WITH linear warm-up (better for ViT as per HF article)
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = int(args.warmup_ratio * total_steps)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
     
     # Training loop
     best_val_acc = 0.0
@@ -148,22 +161,12 @@ def train_model(args):
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         print("-" * 40)
-        # Optionally freeze backbone for first N epochs
-        if epoch == 0 and args.freeze_epochs > 0:
-            model.freeze_backbone()
-            print(f"Backbone frozen for first {args.freeze_epochs} epochs")
-        if epoch == args.freeze_epochs:
-            model.unfreeze_backbone()
-            print("Backbone unfrozen – full fine-tuning now")
-
+        
         # Train
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device, scheduler)
         
         # Validate
         val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
-        
-        # Update scheduler
-        scheduler.step()
         
         # Save metrics
         train_losses.append(train_loss)
@@ -173,7 +176,10 @@ def train_model(args):
         
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
-        print(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+
+        # Log current LR (scheduler may not expose get_last_lr before first step)
+        current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else optimizer.param_groups[0]["lr"]
+        print(f"Learning Rate: {current_lr:.6f}")
         
         # Save best model
         if val_acc > best_val_acc:
@@ -229,16 +235,15 @@ def main():
                        help='Step size for learning rate scheduler')
     parser.add_argument('--gamma', type=float, default=0.1,
                        help='Gamma for learning rate scheduler')
+    parser.add_argument('--warmup_ratio', type=float, default=0.1,
+                       help='Proportion of total steps used for linear LR warm-up')
     parser.add_argument('--num_workers', type=int, default=2,
                        help='Number of data loader workers (default 2 for Colab)')
     parser.add_argument('--early_stopping_patience', type=int, default=5,
                        help='Epochs to wait for improvement before early stopping')
-    parser.add_argument('--label_smoothing', type=float, default=0.1,
-                       help='Label smoothing factor (0 disables)')
-    parser.add_argument('--freeze_epochs', type=int, default=2,
-                       help='Number of initial epochs to train classifier head only (freeze ViT backbone)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (cuda/mps/cpu). If not specified, auto-detects best available.')
+
     
     args = parser.parse_args()
     
